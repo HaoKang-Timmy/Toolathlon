@@ -1,0 +1,45 @@
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -2776,9 +2776,19 @@ class MLATokenToKVPool(KVCache):
+     # for disagg
+     def get_contiguous_buf_infos(self):
+         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+-        kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
+-        kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
++        # A CP-shared VMM global view contains imported mappings owned by peer
++        # GPUs. GPUDirect RDMA cannot register that entire virtual span from a
++        # single process. In all-CP-ranks disaggregation mode every CP rank
++        # transfers the pages it owns, so expose only the locally backed view.
++        transfer_buffers = (
++            self.cp_shared_kv_buffer
++            if self.enable_cp_shared_kvcache and self.cp_shared_kv_buffer
++            else self.kv_buffer
++        )
++        kv_data_ptrs = [transfer_buffers[i].data_ptr() for i in range(self.layer_num)]
++        kv_data_lens = [transfer_buffers[i].nbytes for i in range(self.layer_num)]
+         kv_item_lens = [
+-            self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
++            transfer_buffers[i][0].nbytes * self.page_size
++            for i in range(self.layer_num)
+         ]
+         return kv_data_ptrs, kv_data_lens, kv_item_lens
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -607,4 +607,15 @@ def filter_kv_indices_for_cp_rank(
+     if cp_size <= 1:
+         return kv_indices, index_slice
+ 
++    # DSA CP-shared KV is rank-major: logical page p is owned by rank
++    # p % cp_size and stored at local page p // cp_size. Select the actual
++    # owner pages and retain the matching, potentially strided, decode slots.
++    if getattr(kv_mgr.server_args, "enable_dsa_cp_shared_kv_cache", False):
++        chunk_start = index_slice.start if index_slice.start is not None else 0
++        owner_mask = (np.asarray(kv_indices) % cp_size) == cp_rank
++        owner_positions = np.flatnonzero(owner_mask)
++        local_indices = np.asarray(kv_indices)[owner_mask] // cp_size
++        dst_positions = owner_positions + chunk_start
++        return local_indices.astype(kv_indices.dtype, copy=False), dst_positions
++
+     rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)

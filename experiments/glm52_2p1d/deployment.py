@@ -31,7 +31,6 @@ def common_args(cfg: dict) -> list[str]:
         "--trust-remote-code",
         "--quantization", "fp8",
         "--tp-size", "8",
-        "--attn-cp-size", "8",
         "--moe-dp-size", "1",
         "--ep-size", "8",
         "--moe-a2a-backend", "none",
@@ -73,10 +72,16 @@ def worker_args(cfg: dict, worker: dict) -> list[str]:
     if worker["role"] == "prefill":
         # Interleave supports batched prefill and leaves MoE A2A at `none`;
         # zigzag forces DeepEP and is explicitly restricted to batch size 1.
-        args += ["--enable-prefill-cp", "--cp-strategy", "interleave", "--enable-dsa-cp-shared-kv-cache"]
+        args += [
+            "--attn-cp-size", "8",
+            "--enable-prefill-cp", "--cp-strategy", "interleave",
+            "--enable-dsa-cp-shared-kv-cache",
+        ]
     else:
-        # GLM DSA explicitly forbids --enable-prefill-cp on a PD decode worker.
-        args += ["--enable-dsa-cp-shared-kv-cache"]
+        # This PD rank mapper requires decode attention CP=1.  D still spans all
+        # eight GPUs with TP=8 and runs EAGLE/MTP=3; CUDA DCP is incompatible
+        # with speculative decoding in the pinned revision.
+        args += ["--attn-cp-size", "1"]
     return args
 
 
@@ -85,15 +90,24 @@ def launch_worker(cfg: dict, worker: dict, run_dir: Path) -> None:
     pid = run_dir / "pids" / f"{worker['name']}.pid"
     args = " ".join(shlex.quote(x) for x in worker_args(cfg, worker))
     cuda12_lib = "/mnt/shared/glm52/sglang-v0513/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
+    # D only exercises decode/speculative GEMM batch dimensions (<= 4 * 48
+    # tokens here), all covered by the fast warmup's dense 1..1024 grid.
+    role_env = (
+        "SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1 "
+        if worker["role"] == "decode"
+        else "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 "
+    )
     command = (
         f"mkdir -p {shlex.quote(str(log.parent))} {shlex.quote(str(pid.parent))}; "
-        f"test ! -f {shlex.quote(str(pid))} || kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
+        f"test ! -f {shlex.quote(str(pid))} || kill -- -$(cat {shlex.quote(str(pid))}) 2>/dev/null || "
+        f"kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
         f"printf '\\n===== restart %s =====\\n' \"$(date --iso-8601=seconds)\" >> {shlex.quote(str(log))}; "
         # `nohup` alone does not leave the launching terminal's process group.
         # A cancelled harness could therefore SIGINT the local decode worker while
         # the SSH-launched prefill workers survived.  `setsid` makes all workers
         # independent from the controller terminal.
         f"nohup setsid env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "
+        f"{role_env}"
         f"PYTHONPATH={shlex.quote(cfg['pythonpath'])} "
         f"LD_LIBRARY_PATH={shlex.quote(cuda12_lib + ':/usr/lib/x86_64-linux-gnu')} "
         f"{shlex.quote(cfg['python'])} -m sglang.launch_server {args} "
@@ -134,6 +148,15 @@ def router_ready(cfg: dict, timeout: float = 3) -> bool:
         )
         if sum(float(value) for value in values) < count:
             return False
+    for worker in cfg["workers"]:
+        worker_url = f"http://{worker['ip']}:{worker['port']}"
+        values = re.findall(
+            rf'^smg_worker_health\{{[^}}]*worker="{re.escape(worker_url)}"[^}}]*\}}\s+([0-9.eE+-]+)$',
+            metrics,
+            flags=re.MULTILINE,
+        )
+        if not values or max(float(value) for value in values) < 1:
+            return False
     return True
 
 
@@ -161,7 +184,8 @@ def launch_router(cfg: dict, run_dir: Path) -> None:
         args += ["--prefill", url, str(worker["bootstrap_port"])] if worker["role"] == "prefill" else ["--decode", url]
     args += ["--prometheus-host", "127.0.0.1", "--prometheus-port", str(router["prometheus_port"])]
     command = (
-        f"test ! -f {shlex.quote(str(pid))} || kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
+        f"test ! -f {shlex.quote(str(pid))} || kill -- -$(cat {shlex.quote(str(pid))}) 2>/dev/null || "
+        f"kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
         f"printf '\\n===== restart %s =====\\n' \"$(date --iso-8601=seconds)\" >> {shlex.quote(str(log))}; "
         f"nohup setsid env PYTHONPATH={shlex.quote(cfg['pythonpath'])} {shlex.quote(cfg['python'])} "
         f"-m sglang_router.launch_router {' '.join(shlex.quote(x) for x in args)} "
@@ -191,7 +215,12 @@ def stop(cfg: dict, run_dir: Path) -> None:
     targets = [(None, "router")] + [(w["ssh"], w["name"]) for w in cfg["workers"]]
     for host, name in targets:
         pid = run_dir / "pids" / f"{name}.pid"
-        run_on(host, f"test ! -f {shlex.quote(str(pid))} || kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true", check=False)
+        run_on(
+            host,
+            f"test ! -f {shlex.quote(str(pid))} || kill -- -$(cat {shlex.quote(str(pid))}) 2>/dev/null || "
+            f"kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true",
+            check=False,
+        )
 
 
 def main() -> None:
