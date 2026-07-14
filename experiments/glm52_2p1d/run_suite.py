@@ -82,12 +82,13 @@ def retry_task_list(level_dir: Path, cfg: dict) -> Path | None:
     return path
 
 
-def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: int) -> None:
+def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: int) -> bool:
     level_dir = run_dir / f"concurrency-{concurrency}"
     level_dir.mkdir(parents=True, exist_ok=True)
     if (level_dir / "complete.marker").exists():
         print(f"already complete: concurrency={concurrency}", flush=True)
-        return
+        return True
+    (level_dir / "incomplete.marker").unlink(missing_ok=True)
     started_at = dt.datetime.now(dt.timezone.utc).isoformat()
     (level_dir / "timing.json").write_text(json.dumps({"started_at": started_at}, indent=2) + "\n")
     cache_record = flush_cache(cfg)
@@ -103,7 +104,8 @@ def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: i
     attempt = 0
     while completed_tasks(level_dir) < expected_tasks(cfg) and attempt < max_repair_attempts:
         attempt += 1
-        missing = retry_task_list(level_dir, cfg) if attempt > 1 else None
+        # A resumed level must not rerun trajectories that already reached durable storage.
+        missing = retry_task_list(level_dir, cfg) if attempt > 1 or completed_tasks(level_dir) else None
         if missing:
             env["TASK_LIST"] = str(missing)
         elif original_task_list:
@@ -122,11 +124,29 @@ def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: i
         if count < expected_tasks(cfg):
             # Infrastructure and task failures are diagnosed in retained logs; resume only missing tasks.
             time.sleep(min(60, 10 * attempt))
-    if completed_tasks(level_dir) != expected_tasks(cfg):
-        raise RuntimeError(f"concurrency={concurrency} incomplete after repair retries: {completed_tasks(level_dir)}/{expected_tasks(cfg)}")
     ended_at = dt.datetime.now(dt.timezone.utc).isoformat()
     (level_dir / "timing.json").write_text(json.dumps({"started_at": started_at, "ended_at": ended_at}, indent=2) + "\n")
-    (level_dir / "complete.marker").write_text(ended_at + "\n")
+    completed = completed_tasks(level_dir)
+    expected = expected_tasks(cfg)
+    if completed == expected:
+        (level_dir / "complete.marker").write_text(ended_at + "\n")
+        return True
+
+    missing_path = retry_task_list(level_dir, cfg)
+    incomplete = {
+        "ended_at": ended_at,
+        "completed_tasks": completed,
+        "expected_tasks": expected,
+        "repair_attempts": attempt,
+        "missing_tasks_file": str(missing_path) if missing_path else None,
+    }
+    (level_dir / "incomplete.marker").write_text(json.dumps(incomplete, indent=2) + "\n")
+    print(
+        f"concurrency={concurrency} remains incomplete after repair retries: "
+        f"{completed}/{expected}; continuing to the next level",
+        flush=True,
+    )
+    return False
 
 
 def main() -> None:
@@ -135,6 +155,7 @@ def main() -> None:
     parser.add_argument("--run-id", default=dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     parser.add_argument("--reuse-cluster", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run one task at concurrency 1 instead of the full suite")
+    parser.add_argument("--smoke-task", help="Task directory name to use with --smoke")
     parser.add_argument("--max-repair-attempts", type=int, default=5)
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -156,11 +177,15 @@ def main() -> None:
         if args.smoke:
             smoke_cfg = dict(cfg)
             smoke_cfg["concurrency"] = [1]
-            task = next(path.name for path in (REPO / "tasks" / cfg["task_folder"]).iterdir() if path.is_dir())
+            task_root = REPO / "tasks" / cfg["task_folder"]
+            task = args.smoke_task or next(path.name for path in task_root.iterdir() if path.is_dir())
+            if not (task_root / task).is_dir():
+                raise ValueError(f"unknown smoke task: {task}")
             task_list = run_dir / "smoke_task.txt"
             task_list.write_text(task + "\n")
             os.environ["TASK_LIST"] = str(task_list)
-            run_level(smoke_cfg, run_dir, 1, args.max_repair_attempts)
+            if not run_level(smoke_cfg, run_dir, 1, args.max_repair_attempts):
+                raise RuntimeError("smoke task did not produce a trajectory")
         else:
             for concurrency in cfg["concurrency"]:
                 run_level(cfg, run_dir, concurrency, args.max_repair_attempts)
