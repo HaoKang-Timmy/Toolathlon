@@ -580,8 +580,12 @@ echo " Executing necessary configurations"
 copy_config_cmd='
   for dir in ~/.gmail-mcp ~/.calendar-mcp; do
     mkdir -p $dir
-    cp ./configs/gcp-oauth.keys.json $dir/
-    cp ./configs/google_credentials.json $dir/credentials.json
+    if [ -f ./configs/gcp-oauth.keys.json ]; then
+      cp ./configs/gcp-oauth.keys.json $dir/
+    fi
+    if [ -f ./configs/google_credentials.json ]; then
+      cp ./configs/google_credentials.json $dir/credentials.json
+    fi
   done
 '
 if [ "$runmode" = "quickstart" ]; then
