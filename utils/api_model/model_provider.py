@@ -5,6 +5,7 @@ import json
 import datetime
 import time
 import uuid
+from dataclasses import replace
 from agents import (
     ModelProvider,
     OpenAIChatCompletionsModel,
@@ -518,6 +519,29 @@ class ContextTooLongError(Exception):
         super().__init__(message)
         self.token_count = token_count
         self.max_tokens = max_tokens
+
+
+def _reduced_max_tokens_for_context_error(error: str, safety_tokens: int = 256) -> int | None:
+    """Return a safe output budget when the prompt itself still fits.
+
+    SGLang reports both the prompt and requested completion sizes in this error
+    form. Retrying with a smaller completion is lossless for the input history
+    and avoids abandoning otherwise valid long-running tool trajectories.
+    """
+    context_match = re.search(r"maximum context length of\s+(\d+)", error, re.IGNORECASE)
+    usage_match = re.search(
+        r"(\d+) tokens from (?:the )?input messages and (\d+) tokens for (?:the )?completion",
+        error,
+        re.IGNORECASE,
+    )
+    if not context_match or not usage_match:
+        return None
+    context_tokens = int(context_match.group(1))
+    prompt_tokens, requested_output_tokens = map(int, usage_match.groups())
+    available_output_tokens = context_tokens - prompt_tokens - safety_tokens
+    if available_output_tokens < 256 or available_output_tokens >= requested_output_tokens:
+        return None
+    return available_output_tokens
 
 
 def _metrics_output_delta(chunk: ChatCompletionChunk) -> bool:
@@ -1173,10 +1197,21 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
                     ]):
                         context_too_long = True
                 
-                # If context too long detected, do not retry, raise
+                # Retry only when the server gives enough information to fit a
+                # smaller completion; otherwise surface the context error.
                 if context_too_long:
                     if self.debug:
                         print(f"Context too long detected: {error_str}")
+
+                    reduced_max_tokens = _reduced_max_tokens_for_context_error(error_str)
+                    model_settings = kwargs.get("model_settings")
+                    if reduced_max_tokens is not None and isinstance(model_settings, ModelSettings) and i < self.retry_times - 1:
+                        kwargs["model_settings"] = replace(model_settings, max_tokens=reduced_max_tokens)
+                        print(
+                            "[Warning] Retrying context-limited request with max_tokens="
+                            f"{reduced_max_tokens}"
+                        )
+                        continue
                     
                     # Create more detailed error message
                     error_msg = f"Context too long: {error_str}"

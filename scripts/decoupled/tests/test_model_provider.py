@@ -2,6 +2,7 @@ import unittest
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
@@ -16,6 +17,7 @@ from agents.models.interface import ModelTracing
 from utils.api_model.model_provider import (
     OpenAIChatCompletionsModelWithRetry,
     _normalize_tool_arguments_for_history,
+    _reduced_max_tokens_for_context_error,
 )
 
 
@@ -57,6 +59,49 @@ class OpenAIChatCompletionsModelWithRetryTests(unittest.IsolatedAsyncioTestCase)
             json.loads(_normalize_tool_arguments_for_history('["Paris"]')),
             {"_raw_tool_arguments": ["Paris"]},
         )
+
+    def test_reduced_max_tokens_for_context_error(self) -> None:
+        error = (
+            "Requested token count exceeds the model's maximum context length of 262144 tokens. "
+            "You requested a total of 277644 tokens: 212108 tokens from the input messages "
+            "and 65536 tokens for the completion."
+        )
+        self.assertEqual(_reduced_max_tokens_for_context_error(error), 49780)
+        self.assertIsNone(
+            _reduced_max_tokens_for_context_error(
+                "maximum context length of 262144 tokens; 262100 tokens from input messages "
+                "and 65536 tokens for completion"
+            )
+        )
+
+    async def test_context_error_retries_with_reduced_output_budget(self) -> None:
+        model = self.build_model()
+        model.retry_times = 2
+        budgets = []
+
+        async def fake_raw_get_response(*args, **kwargs):
+            budgets.append(kwargs["model_settings"].max_tokens)
+            if len(budgets) == 1:
+                raise Exception(
+                    "Error code: 400: Requested token count exceeds the model's maximum "
+                    "context length of 262144 tokens. You requested a total of 277644 "
+                    "tokens: 212108 tokens from the input messages and 65536 tokens for "
+                    "the completion."
+                )
+            return SimpleNamespace(output=[])
+
+        model.raw_get_response = fake_raw_get_response  # type: ignore[method-assign]
+        await model.get_response(
+            system_instructions=None,
+            input="test",
+            model_settings=ModelSettings(max_tokens=65536),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+        )
+        self.assertEqual(budgets, [65536, 49780])
 
     def build_model(self) -> OpenAIChatCompletionsModelWithRetry:
         client = AsyncOpenAI(api_key="test-key", base_url="https://example.com/v1")
