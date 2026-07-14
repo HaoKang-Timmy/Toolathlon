@@ -32,11 +32,25 @@ def read_jsonl(path: Path):
 
 def extract_tool_names(value, result: Counter) -> None:
     if isinstance(value, dict):
+        # Chat Completions stores the callable name one level below each
+        # assistant tool-call object. Count it here, then skip that list in
+        # the generic recursion so one call cannot be counted twice.
+        tool_calls = value.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                name = function.get("name") if isinstance(function, dict) else call.get("name")
+                if name:
+                    result[str(name)] += 1
         kind = str(value.get("type", ""))
         name = value.get("name")
         if name and kind in {"function_call", "tool_call", "function"}:
             result[str(name)] += 1
-        for child in value.values():
+        for key, child in value.items():
+            if key == "tool_calls":
+                continue
             extract_tool_names(child, result)
     elif isinstance(value, list):
         for child in value:
