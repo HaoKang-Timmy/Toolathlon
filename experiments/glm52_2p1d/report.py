@@ -80,7 +80,15 @@ def build_report(level_dir: Path) -> dict:
     gpu_rows = []
     sglang_values = defaultdict(list)
     monitor_path = level_dir.parent / "monitor" / "samples.jsonl"
+    try:
+        timing = json.loads((level_dir / "timing.json").read_text())
+    except Exception:
+        timing = {}
     for sample in read_jsonl(monitor_path):
+        if timing.get("started_at") and sample["timestamp"] < timing["started_at"]:
+            continue
+        if timing.get("ended_at") and sample["timestamp"] > timing["ended_at"]:
+            continue
         for node, gpus in sample.get("gpus", {}).items():
             for gpu in gpus:
                 row = {"timestamp": sample["timestamp"], "node": node, **gpu}
@@ -94,6 +102,11 @@ def build_report(level_dir: Path) -> dict:
         "request_attempts": len(attempts),
         "request_errors": sum(row.get("status") != "ok" for row in attempts),
         "successful_requests": len(successful),
+        "aggregate_cache_hit_rate": (
+            sum(float(row.get("cached_prompt_tokens", 0) or 0) for row in successful)
+            / sum(float(row.get("prompt_tokens", 0) or 0) for row in successful)
+            if sum(float(row.get("prompt_tokens", 0) or 0) for row in successful) else None
+        ),
         "request_metrics": {field: quantiles([row.get(field) for row in successful if row.get(field) is not None]) for field in fields},
         "tasks_with_trajectory": len(task_tool_counts),
         "task_status_distribution": dict(statuses),

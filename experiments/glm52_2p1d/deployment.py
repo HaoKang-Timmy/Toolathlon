@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -70,7 +71,9 @@ def worker_args(cfg: dict, worker: dict) -> list[str]:
         "--disaggregation-ib-device", json.dumps(cfg["ib_device_map"], separators=(",", ":")),
     ]
     if worker["role"] == "prefill":
-        args += ["--enable-prefill-cp", "--cp-strategy", "zigzag", "--enable-dsa-cp-shared-kv-cache"]
+        # Interleave supports batched prefill and leaves MoE A2A at `none`;
+        # zigzag forces DeepEP and is explicitly restricted to batch size 1.
+        args += ["--enable-prefill-cp", "--cp-strategy", "interleave", "--enable-dsa-cp-shared-kv-cache"]
     else:
         # GLM DSA explicitly forbids --enable-prefill-cp on a PD decode worker.
         args += ["--enable-dsa-cp-shared-kv-cache"]
@@ -81,13 +84,20 @@ def launch_worker(cfg: dict, worker: dict, run_dir: Path) -> None:
     log = run_dir / "servers" / f"{worker['name']}.log"
     pid = run_dir / "pids" / f"{worker['name']}.pid"
     args = " ".join(shlex.quote(x) for x in worker_args(cfg, worker))
+    cuda12_lib = "/mnt/shared/glm52/sglang-v0513/lib/python3.12/site-packages/nvidia/cuda_runtime/lib"
     command = (
         f"mkdir -p {shlex.quote(str(log.parent))} {shlex.quote(str(pid.parent))}; "
         f"test ! -f {shlex.quote(str(pid))} || kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
-        f"nohup env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "
+        f"printf '\\n===== restart %s =====\\n' \"$(date --iso-8601=seconds)\" >> {shlex.quote(str(log))}; "
+        # `nohup` alone does not leave the launching terminal's process group.
+        # A cancelled harness could therefore SIGINT the local decode worker while
+        # the SSH-launched prefill workers survived.  `setsid` makes all workers
+        # independent from the controller terminal.
+        f"nohup setsid env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 "
         f"PYTHONPATH={shlex.quote(cfg['pythonpath'])} "
+        f"LD_LIBRARY_PATH={shlex.quote(cuda12_lib + ':/usr/lib/x86_64-linux-gnu')} "
         f"{shlex.quote(cfg['python'])} -m sglang.launch_server {args} "
-        f"> {shlex.quote(str(log))} 2>&1 < /dev/null & echo $! > {shlex.quote(str(pid))}"
+        f">> {shlex.quote(str(log))} 2>&1 < /dev/null & echo $! > {shlex.quote(str(pid))}"
     )
     run_on(worker["ssh"], command)
 
@@ -98,6 +108,33 @@ def healthy(url: str, timeout: float = 3) -> bool:
             return response.status == 200
     except Exception:
         return False
+
+
+def router_ready(cfg: dict, timeout: float = 3) -> bool:
+    """Require the router and every configured PD worker pool to be active."""
+    router = cfg["router"]
+    base_url = f"http://{router['host']}:{router['port']}"
+    if not healthy(base_url, timeout):
+        return False
+    metrics_url = f"http://{router['host']}:{router['prometheus_port']}/metrics"
+    try:
+        with urllib.request.urlopen(metrics_url, timeout=timeout) as response:
+            metrics = response.read().decode(errors="replace")
+    except Exception:
+        return False
+    expected = {
+        role: sum(worker["role"] == role for worker in cfg["workers"])
+        for role in ("prefill", "decode")
+    }
+    for role, count in expected.items():
+        values = re.findall(
+            rf'^smg_worker_pool_size\{{[^}}]*worker_type="{role}"[^}}]*\}}\s+([0-9.eE+-]+)$',
+            metrics,
+            flags=re.MULTILINE,
+        )
+        if sum(float(value) for value in values) < count:
+            return False
+    return True
 
 
 def wait_workers(cfg: dict, timeout: int) -> None:
@@ -118,16 +155,17 @@ def launch_router(cfg: dict, run_dir: Path) -> None:
     router = cfg["router"]
     log = run_dir / "servers" / "router.log"
     pid = run_dir / "pids" / "router.pid"
-    args = ["--host", router["host"], "--port", str(router["port"]), "--policy", "cache_aware"]
+    args = ["--pd-disaggregation", "--host", router["host"], "--port", str(router["port"]), "--policy", "cache_aware"]
     for worker in cfg["workers"]:
         url = f"http://{worker['ip']}:{worker['port']}"
         args += ["--prefill", url, str(worker["bootstrap_port"])] if worker["role"] == "prefill" else ["--decode", url]
     args += ["--prometheus-host", "127.0.0.1", "--prometheus-port", str(router["prometheus_port"])]
     command = (
         f"test ! -f {shlex.quote(str(pid))} || kill $(cat {shlex.quote(str(pid))}) 2>/dev/null || true; "
-        f"nohup env PYTHONPATH={shlex.quote(cfg['pythonpath'])} {shlex.quote(cfg['python'])} "
+        f"printf '\\n===== restart %s =====\\n' \"$(date --iso-8601=seconds)\" >> {shlex.quote(str(log))}; "
+        f"nohup setsid env PYTHONPATH={shlex.quote(cfg['pythonpath'])} {shlex.quote(cfg['python'])} "
         f"-m sglang_router.launch_router {' '.join(shlex.quote(x) for x in args)} "
-        f"> {shlex.quote(str(log))} 2>&1 < /dev/null & echo $! > {shlex.quote(str(pid))}"
+        f">> {shlex.quote(str(log))} 2>&1 < /dev/null & echo $! > {shlex.quote(str(pid))}"
     )
     run_on(None, command)
 
@@ -142,10 +180,10 @@ def deploy(cfg: dict, run_dir: Path, timeout: int) -> None:
     launch_router(cfg, run_dir)
     router_url = f"http://{cfg['router']['host']}:{cfg['router']['port']}"
     deadline = time.monotonic() + 300
-    while time.monotonic() < deadline and not healthy(router_url):
+    while time.monotonic() < deadline and not router_ready(cfg):
         time.sleep(5)
-    if not healthy(router_url):
-        raise TimeoutError("router did not become healthy")
+    if not router_ready(cfg):
+        raise TimeoutError("router did not register all configured prefill/decode workers")
     print(f"cluster ready: {router_url}/v1")
 
 

@@ -12,7 +12,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from deployment import deploy, healthy, load_config
+from deployment import deploy, load_config, router_ready
 
 
 HERE = Path(__file__).resolve().parent
@@ -45,7 +45,7 @@ def capture_manifest(run_dir: Path, cfg: dict) -> None:
         "docker_images": ["docker", "images", "--digests"],
         "nvidia_smi": ["nvidia-smi"],
         "disk": ["df", "-h", "/", "/mnt/shared"],
-        "python_packages": [cfg["python"], "-m", "uv", "pip", "freeze"],
+        "python_packages": ["uv", "pip", "freeze", "--python", cfg["python"]],
     }
     for name, command in commands.items():
         try:
@@ -88,6 +88,8 @@ def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: i
     if (level_dir / "complete.marker").exists():
         print(f"already complete: concurrency={concurrency}", flush=True)
         return
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    (level_dir / "timing.json").write_text(json.dumps({"started_at": started_at}, indent=2) + "\n")
     cache_record = flush_cache(cfg)
     (level_dir / "cache_flush.json").write_text(json.dumps(cache_record, indent=2) + "\n")
     env = os.environ.copy()
@@ -122,7 +124,9 @@ def run_level(cfg: dict, run_dir: Path, concurrency: int, max_repair_attempts: i
             time.sleep(min(60, 10 * attempt))
     if completed_tasks(level_dir) != expected_tasks(cfg):
         raise RuntimeError(f"concurrency={concurrency} incomplete after repair retries: {completed_tasks(level_dir)}/{expected_tasks(cfg)}")
-    (level_dir / "complete.marker").write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+    ended_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    (level_dir / "timing.json").write_text(json.dumps({"started_at": started_at, "ended_at": ended_at}, indent=2) + "\n")
+    (level_dir / "complete.marker").write_text(ended_at + "\n")
 
 
 def main() -> None:
@@ -139,8 +143,8 @@ def main() -> None:
     capture_manifest(run_dir, cfg)
     if not args.reuse_cluster:
         deploy(cfg, run_dir, 3600)
-    elif not healthy(f"http://{cfg['router']['host']}:{cfg['router']['port']}"):
-        raise RuntimeError("--reuse-cluster requested but router is not healthy")
+    elif not router_ready(cfg):
+        raise RuntimeError("--reuse-cluster requested but router has not registered the complete 2P1D worker set")
 
     stop_file = run_dir / "monitor.stop"
     stop_file.unlink(missing_ok=True)

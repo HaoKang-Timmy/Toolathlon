@@ -478,7 +478,12 @@ class _MetricsStream:
 
 
 def _cached_tokens(usage: Any) -> int:
+    cached = getattr(usage, "cached_input_tokens", None)
+    if cached is not None:
+        return int(cached or 0)
     details = getattr(usage, "input_tokens_details", None)
+    if isinstance(details, dict):
+        return int(details.get("cached_tokens", 0) or 0)
     return int(getattr(details, "cached_tokens", 0) or 0)
 
 
