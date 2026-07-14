@@ -1,4 +1,7 @@
 import unittest
+import json
+import os
+import tempfile
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
@@ -139,6 +142,50 @@ class OpenAIChatCompletionsModelWithRetryTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(response.usage.total_tokens, 11)
         self.assertEqual(response.output[0].type, "message")
         self.assertEqual(response.output[0].content[0].text, "hello streamed")
+
+    async def test_request_metrics_capture_stream_latency_and_tokens(self) -> None:
+        model = self.build_model()
+        initial_response = Response(
+            id="resp_metrics", created_at=0.0, model="test-model", object="response",
+            output=[], tool_choice="auto", tools=[], parallel_tool_calls=False,
+        )
+        stream = FakeChatCompletionStream([
+            ChatCompletionChunk(
+                id="chunk_1", choices=[ChunkChoice(delta=ChoiceDelta(content="hello", role="assistant"), finish_reason=None, index=0, logprobs=None)],
+                created=0, model="test-model", object="chat.completion.chunk", usage=None,
+            ),
+            ChatCompletionChunk(
+                id="chunk_2", choices=[], created=0, model="test-model", object="chat.completion.chunk",
+                usage=CompletionUsage(prompt_tokens=9, completion_tokens=3, total_tokens=12),
+            ),
+        ])
+
+        async def fake_fetch_response(*args, **kwargs):
+            self.assertTrue(kwargs["stream"])
+            return initial_response, stream
+
+        model._fetch_response = fake_fetch_response  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "requests.jsonl")
+            old = os.environ.get("TOOLATHLON_REQUEST_METRICS_PATH")
+            os.environ["TOOLATHLON_REQUEST_METRICS_PATH"] = path
+            try:
+                await model.get_response(
+                    system_instructions=None, input="hi", model_settings=ModelSettings(), tools=[],
+                    output_schema=None, handoffs=[], tracing=ModelTracing.DISABLED, previous_response_id=None,
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("TOOLATHLON_REQUEST_METRICS_PATH", None)
+                else:
+                    os.environ["TOOLATHLON_REQUEST_METRICS_PATH"] = old
+            with open(path, encoding="utf-8") as handle:
+                record = json.load(handle)
+            self.assertEqual(record["status"], "ok")
+            self.assertEqual(record["prompt_tokens"], 9)
+            self.assertEqual(record["decode_tokens"], 3)
+            self.assertIsNotNone(record["ttft_ms"])
+            self.assertIsNotNone(record["tpot_ms"])
 
 
 if __name__ == "__main__":

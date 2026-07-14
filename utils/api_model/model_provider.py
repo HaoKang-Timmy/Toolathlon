@@ -2,6 +2,9 @@ import asyncio
 import re
 import os
 import json
+import datetime
+import time
+import uuid
 from agents import (
     ModelProvider,
     OpenAIChatCompletionsModel,
@@ -437,6 +440,59 @@ class ContextTooLongError(Exception):
         self.token_count = token_count
         self.max_tokens = max_tokens
 
+
+def _metrics_output_delta(chunk: ChatCompletionChunk) -> bool:
+    """Return whether a streamed chunk contains a user-visible model delta."""
+    for choice in chunk.choices or []:
+        delta = choice.delta
+        if any(getattr(delta, field, None) for field in ("content", "refusal", "tool_calls")):
+            return True
+        model_extra = getattr(delta, "model_extra", None) or {}
+        if model_extra.get("reasoning_content") or model_extra.get("reasoning_details"):
+            return True
+    return False
+
+
+class _MetricsStream:
+    """Transparent async iterator that timestamps raw Chat Completions chunks."""
+
+    def __init__(self, stream, state: dict):
+        self._iterator = stream.__aiter__()
+        self.state = state
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        chunk = await self._iterator.__anext__()
+        now = time.perf_counter()
+        self.state["stream_chunk_count"] += 1
+        if _metrics_output_delta(chunk):
+            self.state["output_chunk_count"] += 1
+            self.state["first_output_at"] = self.state["first_output_at"] or now
+            self.state["last_output_at"] = now
+        for choice in chunk.choices or []:
+            if choice.finish_reason:
+                self.state["finish_reason"] = choice.finish_reason
+        return chunk
+
+
+def _cached_tokens(usage: Any) -> int:
+    details = getattr(usage, "input_tokens_details", None)
+    return int(getattr(details, "cached_tokens", 0) or 0)
+
+
+def _append_request_metric(path: str, record: dict) -> None:
+    """Append one atomic JSONL record; each task has its own output file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    payload = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o664)
+    try:
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
     def __init__(self, model: str, 
                  openai_client: AsyncOpenAI, 
@@ -727,29 +783,93 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
         tracing: ModelTracing,
         previous_response_id: str | None,
     ) -> ModelResponse:
+        metrics_path = os.environ.get("TOOLATHLON_REQUEST_METRICS_PATH")
+        started_at = time.perf_counter()
+        started_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        metric_state = {
+            "first_output_at": None,
+            "last_output_at": None,
+            "stream_chunk_count": 0,
+            "output_chunk_count": 0,
+            "finish_reason": None,
+        }
+        usage = Usage()
+        metric_status = "error"
+        metric_error = None
+
+        def persist_metric() -> None:
+            if not metrics_path:
+                return
+            ended_at = time.perf_counter()
+            prompt_tokens = int(usage.input_tokens or 0)
+            decode_tokens = int(usage.output_tokens or 0)
+            cached_tokens = _cached_tokens(usage)
+            first_at = metric_state["first_output_at"]
+            last_at = metric_state["last_output_at"]
+            ttft_ms = (first_at - started_at) * 1000 if first_at is not None else None
+            tpot_ms = None
+            if first_at is not None and last_at is not None and decode_tokens > 1:
+                tpot_ms = (last_at - first_at) * 1000 / (decode_tokens - 1)
+            _append_request_metric(metrics_path, {
+                "schema_version": 1,
+                "request_id": str(uuid.uuid4()),
+                "request_group_id": getattr(self, "_metrics_request_group_id", None),
+                "attempt": getattr(self, "_metrics_attempt", 1),
+                "task": os.environ.get("TOOLATHLON_TASK_NAME"),
+                "model": self.model,
+                "base_url": str(self._client.base_url),
+                "started_at": started_utc,
+                "ended_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "status": metric_status,
+                "error": metric_error,
+                "finish_reason": metric_state["finish_reason"],
+                "ttft_ms": ttft_ms,
+                "tpot_ms": tpot_ms,
+                "e2e_ms": (ended_at - started_at) * 1000,
+                "prompt_tokens": prompt_tokens,
+                "cached_prompt_tokens": cached_tokens,
+                "uncached_prompt_tokens": max(0, prompt_tokens - cached_tokens),
+                "decode_tokens": decode_tokens,
+                "total_tokens": int(usage.total_tokens or prompt_tokens + decode_tokens),
+                "stream_chunk_count": metric_state["stream_chunk_count"],
+                "output_chunk_count": metric_state["output_chunk_count"],
+            })
+
         with generation_span(
             model=str(self.model),
             model_config=model_settings.to_json_dict() | {"base_url": str(self._client.base_url)},
             disabled=tracing.is_disabled(),
         ) as span_generation:
-            response = await self._fetch_response(
-                system_instructions,
-                input,
-                model_settings,
-                tools,
-                output_schema,
-                handoffs,
-                span_generation,
-                tracing,
-                stream=False,
-            )
+            try:
+                response = await self._fetch_response(
+                    system_instructions,
+                    input,
+                    model_settings,
+                    tools,
+                    output_schema,
+                    handoffs,
+                    span_generation,
+                    tracing,
+                    stream=bool(metrics_path),
+                )
+            except Exception as exc:
+                metric_error = f"{type(exc).__name__}: {exc}"
+                persist_metric()
+                raise
 
             message: ChatCompletionMessage | None = None
             first_choice: Choice | None = None
 
             if isinstance(response, tuple):
                 initial_response, stream = response
-                final_response = await self._collect_streamed_response(initial_response, stream)
+                try:
+                    final_response = await self._collect_streamed_response(
+                        initial_response, _MetricsStream(stream, metric_state) if metrics_path else stream
+                    )
+                except Exception as exc:
+                    metric_error = f"{type(exc).__name__}: {exc}"
+                    persist_metric()
+                    raise
                 usage = self._usage_from_response(final_response)
                 items = final_response.output
 
@@ -796,6 +916,9 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
                 "output_tokens": usage.output_tokens,
             }
 
+            metric_status = "ok"
+            persist_metric()
+
             return ModelResponse(
                 output=items,
                 usage=usage,
@@ -803,7 +926,9 @@ class OpenAIChatCompletionsModelWithRetry(OpenAIChatCompletionsModel):
             )
 
     async def get_response(self, *args, **kwargs):
+        self._metrics_request_group_id = str(uuid.uuid4())
         for i in range(self.retry_times):
+            self._metrics_attempt = i + 1
             try:
                 model_response = await self.raw_get_response(*args, **kwargs)
                 output_items = model_response.output

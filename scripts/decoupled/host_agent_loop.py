@@ -308,6 +308,14 @@ async def run_host_loop(args: argparse.Namespace) -> int:
     )
     task_config.needed_mcp_servers = [args.gateway_server_name]
 
+    # Opt in to per-request streaming latency/token records for benchmark runs.
+    # Each task writes its own JSONL, avoiding contention between parallel workers.
+    if os.environ.get("TOOLATHLON_CAPTURE_REQUEST_METRICS") == "1":
+        os.environ["TOOLATHLON_REQUEST_METRICS_PATH"] = os.path.join(
+            task_config.task_root, "request_metrics.jsonl"
+        )
+        os.environ["TOOLATHLON_TASK_NAME"] = str(bundle.get("task_name") or task_config.task_str)
+
     # Stop on both local name and MCP-prefixed name.
     task_config.stop.tool_names = expand_stop_tool_names(
         stop_tools=task_config.stop.tool_names or ["local-claim_done"],

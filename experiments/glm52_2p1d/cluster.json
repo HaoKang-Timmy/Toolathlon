@@ -1,0 +1,18 @@
+{
+  "model_path": "/mnt/shared/glm52/models/GLM-5.2-FP8",
+  "served_model_name": "glm-5.2",
+  "python": "/mnt/shared/glm52/sglang-v0513/bin/python",
+  "pythonpath": "/mnt/shared/glm52/sglang-pr29847-overlay:/mnt/shared/glm52-stack/src/sglang-pr29847-resume/python",
+  "results_root": "/mnt/shared/glm52-stack/toolathlon-runs/glm52-2p1d",
+  "router": {"host": "127.0.0.1", "port": 8000, "prometheus_port": 29000},
+  "workers": [
+    {"name": "p0", "role": "prefill", "ssh": "b200-dev-2", "ip": "10.0.12.131", "port": 30000, "bootstrap_port": 8998},
+    {"name": "p1", "role": "prefill", "ssh": "b200-dev-3", "ip": "10.0.5.63", "port": 30000, "bootstrap_port": 8998},
+    {"name": "d0", "role": "decode", "ssh": null, "ip": "10.0.10.96", "port": 30001, "bootstrap_port": 8998}
+  ],
+  "ib_device_map": {"0": "mlx5_0", "1": "mlx5_1", "2": "mlx5_2", "3": "mlx5_3", "4": "mlx5_4", "5": "mlx5_5", "6": "mlx5_6,mlx5_7,mlx5_8,mlx5_9,mlx5_10", "7": "mlx5_11"},
+  "concurrency": [16, 32, 48, 64],
+  "monitor_interval_seconds": 300,
+  "task_folder": "finalpool",
+  "docker_image": "lockon0927/toolathlon-task-image:1016beta"
+}
