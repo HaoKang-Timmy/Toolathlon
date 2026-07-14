@@ -115,6 +115,37 @@ def _json_loads_nullable(value: Any) -> Any | None:
     return value
 
 
+def _normalize_tool_arguments_for_history(value: Any) -> str:
+    """Return a JSON-object string accepted in assistant tool-call history.
+
+    Some streaming parsers can produce a usable call for the tool executor but
+    retain malformed argument fragments in the Responses item.  Sending that
+    item back through Chat Completions makes SGLang reject the entire next
+    turn. Preserve the raw payload inside a valid object instead of losing the
+    trajectory when that happens.
+    """
+    if value in (None, ""):
+        return "{}"
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            print(
+                "[Warning] Repairing malformed streamed tool arguments for history: "
+                f"{value[:500]!r}"
+            )
+            return json.dumps({"_raw_tool_arguments": value}, ensure_ascii=False)
+    else:
+        parsed = value
+    if not isinstance(parsed, dict):
+        print(
+            "[Warning] Wrapping non-object streamed tool arguments for history: "
+            f"{str(parsed)[:500]!r}"
+        )
+        parsed = {"_raw_tool_arguments": parsed}
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 def _has_anthropic_thinking_blocks(content: Any) -> bool:
     return any(bool(getattr(content, field_name, None)) for field_name in _ANTHROPIC_THINKING_BLOCK_FIELDS)
 
@@ -391,7 +422,7 @@ class ConverterWithExplicitReasoningContent(Converter):
                 # each time we enter this, we will pop one extra content in the tool calls
                 extra_contents_in_tool_calls = asst.get("extra_contents_in_tool_calls", [])
                 tool_calls = list(asst.get("tool_calls", []))
-                arguments = func_call["arguments"] if func_call["arguments"] else "{}"
+                arguments = _normalize_tool_arguments_for_history(func_call.get("arguments"))
                 new_tool_call = ChatCompletionMessageToolCallParam(
                     id=func_call["call_id"],
                     type="function",

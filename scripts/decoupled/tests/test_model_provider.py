@@ -13,7 +13,10 @@ from openai.types.responses import Response
 from agents.model_settings import ModelSettings
 from agents.models.interface import ModelTracing
 
-from utils.api_model.model_provider import OpenAIChatCompletionsModelWithRetry
+from utils.api_model.model_provider import (
+    OpenAIChatCompletionsModelWithRetry,
+    _normalize_tool_arguments_for_history,
+)
 
 
 class FakeChatCompletionStream:
@@ -29,6 +32,20 @@ class FakeChatCompletionStream:
 
 
 class OpenAIChatCompletionsModelWithRetryTests(unittest.IsolatedAsyncioTestCase):
+    def test_normalize_tool_arguments_for_history(self) -> None:
+        self.assertEqual(
+            json.loads(_normalize_tool_arguments_for_history('{"city":"Paris"}')),
+            {"city": "Paris"},
+        )
+        self.assertEqual(
+            json.loads(_normalize_tool_arguments_for_history('{"city":"Paris"')),
+            {"_raw_tool_arguments": '{"city":"Paris"'},
+        )
+        self.assertEqual(
+            json.loads(_normalize_tool_arguments_for_history('["Paris"]')),
+            {"_raw_tool_arguments": ["Paris"]},
+        )
+
     def build_model(self) -> OpenAIChatCompletionsModelWithRetry:
         client = AsyncOpenAI(api_key="test-key", base_url="https://example.com/v1")
         return OpenAIChatCompletionsModelWithRetry(
