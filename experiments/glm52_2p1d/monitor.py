@@ -80,7 +80,14 @@ def main() -> None:
     output, stop_file = Path(args.output), Path(args.stop_file)
     output.mkdir(parents=True, exist_ok=True)
     interval = args.interval or cfg["monitor_interval_seconds"]
-    sequence = 0
+    # Continue after a benchmark-driver restart without overwriting retained
+    # raw Prometheus snapshots from the earlier monitor process.
+    existing = [
+        int(path.name)
+        for path in (output / "prometheus").glob("[0-9]*")
+        if path.is_dir() and path.name.isdigit()
+    ]
+    sequence = max(existing, default=-1) + 1
     while True:
         take_sample(cfg, output, sequence)
         sequence += 1
@@ -88,7 +95,10 @@ def main() -> None:
             break
         deadline = time.monotonic() + interval
         while time.monotonic() < deadline and not stop_file.exists():
-            time.sleep(min(5, deadline - time.monotonic()))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(5, remaining))
         if stop_file.exists():
             take_sample(cfg, output, sequence)
             break
