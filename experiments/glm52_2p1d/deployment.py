@@ -94,6 +94,7 @@ def launch_worker(cfg: dict, worker: dict, run_dir: Path) -> None:
     # tokens here), all covered by the fast warmup's dense 1..1024 grid.
     role_env = (
         "SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1 "
+        "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 "
         if worker["role"] == "decode"
         else "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1 "
     )
