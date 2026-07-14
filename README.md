@@ -14,6 +14,8 @@
 
 </div>
 
+Deployment note for the three-node B200 experiment: [GLM-5.2 FP8 CP=8 2P1D with Mooncake and MTP=3](docs/glm52-b200-2p1d.md).
+
 ## Introduction
 Toolathlon is a benchmark to assess language agents' general tool use in realistic environments. It features 600+ diverse tools based on real-world software environments. Each task requires long-horizon tool calls to complete. This repository corresponds to the **Toolathlon-Verified** final release. Below we show a demo task where the agent needs to automatically check assignments in the email box, and grade them on Canvas.
 
