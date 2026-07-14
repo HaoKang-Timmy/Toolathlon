@@ -115,6 +115,47 @@ def _json_loads_nullable(value: Any) -> Any | None:
     return value
 
 
+def _complete_truncated_json_object(value: str) -> dict[str, Any] | None:
+    """Complete only missing trailing JSON container delimiters.
+
+    This intentionally does not guess missing quotes, commas, keys, or values.
+    It is safe for the GLM streaming-parser failure seen in production, where
+    the emitted argument fragment is otherwise valid and only the final ``}``
+    (occasionally more than one trailing container delimiter) is absent.
+    """
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    matching_open = {"}": "{", "]": "["}
+    matching_close = {"{": "}", "[": "]"}
+
+    for char in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in matching_close:
+            stack.append(char)
+        elif char in matching_open:
+            if not stack or stack.pop() != matching_open[char]:
+                return None
+
+    if in_string or not stack:
+        return None
+    candidate = value + "".join(matching_close[char] for char in reversed(stack))
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _normalize_tool_arguments_for_history(value: Any) -> str:
     """Return a JSON-object string accepted in assistant tool-call history.
 
@@ -130,11 +171,18 @@ def _normalize_tool_arguments_for_history(value: Any) -> str:
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
-            print(
-                "[Warning] Repairing malformed streamed tool arguments for history: "
-                f"{value[:500]!r}"
-            )
-            return json.dumps({"_raw_tool_arguments": value}, ensure_ascii=False)
+            parsed = _complete_truncated_json_object(value)
+            if parsed is not None:
+                print(
+                    "[Warning] Completing truncated streamed tool arguments for history: "
+                    f"{value[:500]!r}"
+                )
+            else:
+                print(
+                    "[Warning] Wrapping malformed streamed tool arguments for history: "
+                    f"{value[:500]!r}"
+                )
+                return json.dumps({"_raw_tool_arguments": value}, ensure_ascii=False)
     else:
         parsed = value
     if not isinstance(parsed, dict):

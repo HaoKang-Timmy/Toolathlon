@@ -39,7 +39,19 @@ class OpenAIChatCompletionsModelWithRetryTests(unittest.IsolatedAsyncioTestCase)
         )
         self.assertEqual(
             json.loads(_normalize_tool_arguments_for_history('{"city":"Paris"')),
-            {"_raw_tool_arguments": '{"city":"Paris"'},
+            {"city": "Paris"},
+        )
+        self.assertEqual(
+            json.loads(
+                _normalize_tool_arguments_for_history(
+                    '{"query":"q","variables":{"project":"p"}'
+                )
+            ),
+            {"query": "q", "variables": {"project": "p"}},
+        )
+        self.assertEqual(
+            json.loads(_normalize_tool_arguments_for_history('{"city":"Paris]')),
+            {"_raw_tool_arguments": '{"city":"Paris]'},
         )
         self.assertEqual(
             json.loads(_normalize_tool_arguments_for_history('["Paris"]')),
