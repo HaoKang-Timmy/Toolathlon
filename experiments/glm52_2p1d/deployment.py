@@ -44,7 +44,10 @@ def common_args(cfg: dict) -> list[str]:
         "--chunked-prefill-size", "32768",
         "--mem-fraction-static", "0.85",
         "--reasoning-parser", "glm45",
-        "--tool-call-parser", "glm45",
+        # GLM-5 emits the compact GLM-4.7 tool format, where <arg_key>
+        # immediately follows the function name without a newline.  The
+        # legacy glm45 parser requires that newline and corrupts the name.
+        "--tool-call-parser", "glm47",
         "--disable-shared-experts-fusion",
         "--disable-custom-all-reduce",
         "--enable-metrics",
